@@ -1,9 +1,11 @@
 /**
- * Backend Ujian TKA (Format TKA, 28 soal) v2 - Google Apps Script.
- * Lock singkat, SID stabil, jalur GET/JSONP cadangan, cache config, menu pemulihan guru.
+ * Backend Ujian TKA (Format TKA, 28 soal) v3 - Google Apps Script.
+ * Perbaikan: submit ringan (1 tulisan), hasil dipindah batch lewat trigger tiap menit,
+ * lock singkat (tryLock), cache baris sesi, log pelanggaran tanpa lock, menu pemulihan guru.
  */
 const SS_ID = '1Cjyy_JaxD7fwSkt5AmCbkMTuCxj3URnVeVnYorEP2yI';
 const L = 'ABCD', BS = ['Benar', 'Salah'], ST = ['Sesuai', 'Tidak Sesuai'];
+const NCOL = 11; // kolom sheet Sesi
 
 const BANK = [
  {s:"Notice: Industrial Visit to Prima Hotel. Meet in front of the school office at 7:30 a.m. on Friday. Wear the school uniform. Bring your student ID.",q:[
@@ -59,6 +61,7 @@ function onOpen() {
     .addItem('Setup Awal', 'setup')
     .addItem('Reset Sesi Siswa (izinkan ulang)', 'resetSesi')
     .addSeparator()
+    .addItem('Sinkron Hasil Sekarang', 'flushHasil')
     .addItem('Pulihkan / Kumpulkan Paksa (siswa gagal kirim)', 'pulihkan')
     .addItem('Input Jawaban dari Kode Cadangan', 'inputManual')
     .addItem('Rekap Otomatis', 'rekap').addToUi();
@@ -70,20 +73,24 @@ function setup() {
     Hasil: ['Mulai','Selesai','Durasi (menit)','Nama','NIS','Kelas','Skor A','Skor B','Skor C','Skor Total','Nilai','Pelanggaran','Status','User Agent'],
     Jawaban_Detail: ['Timestamp','NIS','Nama','No Soal Asli','Jawaban Siswa','Kunci','Benar?'],
     Log_Pelanggaran: ['Timestamp','NIS','Nama','Jenis','Pelanggaran ke-'],
-    Sesi: ['NIS','Nama','Kelas','Mulai (ms)','Status','Jawaban','Pelanggaran','SID','User Agent','Skor'],
+    Sesi: ['NIS','Nama','Kelas','Mulai (ms)','Status','Jawaban','Pelanggaran','SID','User Agent','Skor','Selesai (ms)'],
     Config: ['KEY','VALUE']
   };
   Object.keys(H).forEach(n => {
     const s = ss.getSheetByName(n) || ss.insertSheet(n);
     if (s.getLastRow() === 0) { s.getRange(1,1,1,H[n].length).setValues([H[n]]).setFontWeight('bold'); s.setFrozenRows(1); }
   });
-  ss.getSheetByName('Sesi').getRange('A:A').setNumberFormat('@');
+  const se = ss.getSheetByName('Sesi');
+  if (!se.getRange(1, 11).getValue()) se.getRange(1, 11).setValue('Selesai (ms)').setFontWeight('bold');
+  se.getRange('A:A').setNumberFormat('@');
   ss.getSheetByName('Hasil').getRange('E:E').setNumberFormat('@');
   ss.getSheetByName('Jawaban_Detail').getRange('B:B').setNumberFormat('@');
   ss.getSheetByName('Log_Pelanggaran').getRange('B:B').setNumberFormat('@');
   const c = ss.getSheetByName('Config');
-  if (c.getLastRow() < 2) c.getRange(2,1,6,2).setValues([['TOKEN','TKA2026'],['DURASI_MENIT',45],['MAKS_PELANGGARAN',3],['NAVIGASI_BEBAS',true],['TAMPILKAN_NILAI',true],['UJIAN_AKTIF',true]]);
+  if (c.getLastRow() < 2) c.getRange(2,1,6,2).setValues([['TOKEN','TKA2026'],['DURASI_MENIT',45],['MAKS_PELANGGARAN',5],['NAVIGASI_BEBAS',true],['TAMPILKAN_NILAI',true],['UJIAN_AKTIF',true]]);
   CacheService.getScriptCache().remove('cfg');
+  if (!ScriptApp.getProjectTriggers().some(t => t.getHandlerFunction() === 'flushHasil'))
+    ScriptApp.newTrigger('flushHasil').timeBased().everyMinutes(1).create();
   rekap();
 }
 
@@ -97,24 +104,31 @@ function resetSesi() {
   const ui = SpreadsheetApp.getUi();
   const r = ui.prompt('Reset sesi', 'Masukkan NIS siswa:', ui.ButtonSet.OK_CANCEL);
   if (r.getSelectedButton() !== ui.Button.OK) return;
-  const o = sesi(clean(r.getResponseText()));
-  if (!o.v) return ui.alert('NIS tidak ditemukan di sheet Sesi.');
-  o.s.deleteRow(o.r);
-  ui.alert('Sesi direset. Siswa bisa mengulang (data lama di sheet Hasil tetap ada).');
+  const nis = clean(r.getResponseText());
+  kunci(() => {
+    const o = sesi(nis);
+    if (!o.v) return ui.alert('NIS tidak ditemukan di sheet Sesi.');
+    o.s.deleteRow(o.r);
+    CacheService.getScriptCache().remove('r_' + nk(nis));
+    ui.alert('Sesi direset. Siswa bisa mengulang (data lama di sheet Hasil tetap ada).');
+  }, 30000);
 }
 
 // Kumpulkan paksa sesi AKTIF yang waktunya habis (pakai jawaban autosave) dan lengkapi Hasil yang belum tercatat.
 function pulihkan() {
-  const ui = SpreadsheetApp.getUi(), c = cfg(), s = sh('Sesi'), v = s.getDataRange().getValues();
-  const ada = {}; sh('Hasil').getDataRange().getValues().slice(1).forEach(r => ada[nk(r[4])] = 1);
-  const batas = Number(c.DURASI_MENIT) * 60000 + 60000, now = Date.now(); let a = 0, b = 0;
-  for (let i = 1; i < v.length; i++) {
-    const x = v[i]; if (!nk(x[0])) continue;
-    const o = { r: i + 1, s, v: x }, j = safeJson(x[5]);
-    if (x[4] === 'AKTIF') { if (now > Number(x[3]) + batas) { catat(o, j, 'DIKUMPULKAN GURU (waktu habis)'); a++; } }
-    else if (!ada[nk(x[0])]) { catat(o, j, 'DIPULIHKAN', true); b++; }
-  }
-  ui.alert('Selesai.\nDikumpulkan paksa: ' + a + ' siswa\nHasil dipulihkan: ' + b + ' siswa');
+  const ui = SpreadsheetApp.getUi();
+  kunci(() => {
+    const c = cfg(), s = sh('Sesi'), v = s.getDataRange().getValues();
+    const ada = {}; sh('Hasil').getDataRange().getValues().slice(1).forEach(r => ada[nk(r[4])] = 1);
+    const batas = Number(c.DURASI_MENIT) * 60000 + 120000, now = Date.now(); let a = 0, b = 0;
+    for (let i = 1; i < v.length; i++) {
+      const x = v[i]; if (!nk(x[0])) continue;
+      const o = { r: i + 1, s, v: x }, j = safeJson(x[5]);
+      if (x[4] === 'AKTIF') { if (now > Number(x[3]) + batas) { catat(o, j, 'DIKUMPULKAN GURU (waktu habis)'); a++; } }
+      else if (!ada[nk(x[0])]) { catat(o, j, String(x[4]), true); b++; }
+    }
+    ui.alert('Selesai.\nDikumpulkan paksa: ' + a + ' siswa\nHasil dipulihkan: ' + b + ' siswa');
+  }, 30000);
 }
 
 // Tempel "kode cadangan" dari layar siswa yang gagal kirim.
@@ -122,14 +136,16 @@ function inputManual() {
   const ui = SpreadsheetApp.getUi();
   const r = ui.prompt('Input kode cadangan', 'Tempel kode cadangan siswa:', ui.ButtonSet.OK_CANCEL);
   if (r.getSelectedButton() !== ui.Button.OK) return;
-  try {
-    const k = JSON.parse(Utilities.newBlob(Utilities.base64Decode(r.getResponseText().trim())).getDataAsString());
+  let k;
+  try { k = JSON.parse(Utilities.newBlob(Utilities.base64Decode(r.getResponseText().trim())).getDataAsString()); }
+  catch (e) { return ui.alert('Kode tidak valid.'); }
+  kunci(() => {
     const o = sesi(clean(k.n));
     if (!o.v) return ui.alert('NIS tidak ditemukan di sheet Sesi.');
     if (o.v[4] !== 'AKTIF') return ui.alert('Siswa ini sudah tercatat selesai.');
     catat(o, k.j || {}, 'DIINPUT GURU');
     ui.alert('Jawaban ' + o.v[1] + ' berhasil dicatat.');
-  } catch (e) { ui.alert('Kode tidak valid.'); }
+  }, 30000);
 }
 
 // ---------- Utilitas ----------
@@ -152,11 +168,20 @@ function cfg() {
   ca.put('cfg', JSON.stringify(c), 30);
   return c;
 }
-function sesi(nis) { // baca hanya kolom NIS, lalu satu baris
-  const s = sh('Sesi'), n = s.getLastRow(), k = nk(nis);
+// Cari baris siswa. Nomor baris di-cache; selalu diverifikasi terhadap NIS agar aman bila baris bergeser.
+function sesi(nis) {
+  const s = sh('Sesi'), k = nk(nis), ca = CacheService.getScriptCache(), hit = Number(ca.get('r_' + k));
+  if (hit > 1) {
+    const v = s.getRange(hit, 1, 1, NCOL).getValues()[0];
+    if (nk(v[0]) === k) return { r: hit, s, v };
+  }
+  const n = s.getLastRow();
   if (n > 1) {
     const a = s.getRange(2, 1, n - 1, 1).getValues();
-    for (let i = 0; i < a.length; i++) if (nk(a[i][0]) === k) return { r: i + 2, s, v: s.getRange(i + 2, 1, 1, 10).getValues()[0] };
+    for (let i = 0; i < a.length; i++) if (nk(a[i][0]) === k) {
+      ca.put('r_' + k, String(i + 2), 21600);
+      return { r: i + 2, s, v: s.getRange(i + 2, 1, 1, NCOL).getValues()[0] };
+    }
   }
   return { s };
 }
@@ -184,7 +209,12 @@ function nilai(j) {
   return { a, b, c, d };
 }
 const hasil = (tampil, skor) => ({ ok: true, tampil, skor, nilai: Math.round(skor / TOTAL * 10000) / 100, total: TOTAL });
-function kunci(fn) { const k = LockService.getScriptLock(); k.waitLock(30000); try { return fn(); } finally { k.releaseLock(); } }
+// Lock singkat: jika antrean penuh, klien menerima pesan "retry" dan mencoba lagi dengan backoff.
+function kunci(fn, ms) {
+  const k = LockService.getScriptLock();
+  if (!k.tryLock(ms || 8000)) throw new Error('antrean penuh');
+  try { return fn(); } finally { k.releaseLock(); }
+}
 
 // ---------- API ----------
 function route(d) {
@@ -214,19 +244,21 @@ function mulai(d) {
   if (String(d.token).trim().toUpperCase() !== String(c.TOKEN).trim().toUpperCase()) return fail('Token salah.');
   const nis = clean(d.nis), nama = clean(d.nama);
   if (!nis || !nama) return fail('Nama dan NIS wajib diisi.');
-  return kunci(() => {
-    let o = sesi(nis), sid;
-    if (!o.v) {
-      sid = Utilities.getUuid();
-      const r = o.s.getLastRow() + 1;
-      o.s.getRange(r, 1).setNumberFormat('@');
-      o.s.getRange(r, 1, 1, 10).setValues([[nis, nama, clean(d.kelas), Date.now(), 'AKTIF', '{}', 0, sid, clean(d.ua), '']]);
-      o = sesi(nis);
-    } else if (o.v[4] !== 'AKTIF') return { ok: false, selesai: true, msg: 'Anda sudah mengerjakan ujian ini.' };
-    else { sid = String(o.v[7] || '') || Utilities.getUuid(); if (!o.v[7]) o.s.getRange(o.r, 8).setValue(sid); } // SID tetap -> bisa lanjut di perangkat lain
-    return { ok: true, sid, now: Date.now(), mulai: Number(o.v[3]), durasi: Number(c.DURASI_MENIT), nav: bool(c.NAVIGASI_BEBAS),
-      maks: Number(c.MAKS_PELANGGARAN), soal: soalKlien(), jawaban: safeJson(o.v[5]), pel: Number(o.v[6]) };
+  let o = sesi(nis);
+  if (!o.v) o = kunci(() => { // lock hanya saat membuat sesi baru
+    const p = sesi(nis); if (p.v) return p;
+    const sid = Utilities.getUuid(), t0 = Date.now(), r = p.s.getLastRow() + 1,
+          v = [nis, nama, clean(d.kelas), t0, 'AKTIF', '{}', 0, sid, clean(d.ua), '', ''];
+    p.s.getRange(r, 1).setNumberFormat('@');
+    p.s.getRange(r, 1, 1, NCOL).setValues([v]);
+    CacheService.getScriptCache().put('r_' + nk(nis), String(r), 21600);
+    return { r, s: p.s, v };
   });
+  if (o.v[4] !== 'AKTIF') return { ok: false, selesai: true, msg: 'Anda sudah mengerjakan ujian ini.' };
+  let sid = String(o.v[7] || '');
+  if (!sid) { sid = Utilities.getUuid(); o.s.getRange(o.r, 8).setValue(sid); } // SID tetap -> bisa lanjut di perangkat lain
+  return { ok: true, sid, now: Date.now(), mulai: Number(o.v[3]), durasi: Number(c.DURASI_MENIT), nav: bool(c.NAVIGASI_BEBAS),
+    maks: Number(c.MAKS_PELANGGARAN), soal: soalKlien(), jawaban: safeJson(o.v[5]), pel: Number(o.v[6]) };
 }
 
 function simpan(d) { // tanpa lock: ringan & sering dipanggil
@@ -235,35 +267,60 @@ function simpan(d) { // tanpa lock: ringan & sering dipanggil
   return { ok: true };
 }
 
-function logP(d) {
-  return kunci(() => {
-    const o = chk(d); if (o.err) return o.err;
-    const n = Number(o.v[6]) + 1;
-    o.s.getRange(o.r, 7).setValue(n);
-    sh('Log_Pelanggaran').appendRow([new Date(), o.v[0], o.v[1], clean(d.jenis), n]);
-    return { ok: true, pel: n };
-  });
+function logP(d) { // tanpa lock; hitungan tidak bisa turun
+  const o = chk(d); if (o.err) return o.err;
+  const n = Math.max(Number(o.v[6]), Number(d.pel) || Number(o.v[6]) + 1);
+  o.s.getRange(o.r, 7).setValue(n);
+  sh('Log_Pelanggaran').appendRow([new Date(), o.v[0], o.v[1], clean(d.jenis), n]);
+  return { ok: true, pel: n };
 }
 
+// Submit hanya menulis SATU baris di Sesi (cepat). Sheet Hasil & Jawaban_Detail diisi batch oleh flushHasil.
 function submit(d) {
   const tampil = bool(cfg().TAMPILKAN_NILAI);
   return kunci(() => {
     const o = sesi(clean(d.nis));
     if (!o.v || String(o.v[7]) !== String(d.sid)) return fail('Sesi tidak valid. Muat ulang, login lagi, lalu kumpulkan. Jika tetap gagal, serahkan kode cadangan ke guru.');
     if (o.v[4] !== 'AKTIF') return hasil(tampil, Number(o.v[9]) || 0); // idempotent
-    const lewat = Date.now() > Number(o.v[3]) + Number(cfg().DURASI_MENIT) * 60000 + 60000;
+    const now = Date.now();
+    const lewat = now > Number(o.v[3]) + Number(cfg().DURASI_MENIT) * 60000 + 120000;
     const st = d.auto === 'pelanggaran' ? 'AUTO-SUBMIT PELANGGARAN' : (lewat ? 'TERLAMBAT' : 'SELESAI');
-    return hasil(tampil, catat(o, d.jawaban || {}, st));
+    const j = d.jawaban || {}, r = nilai(j), skor = r.a + r.b + r.c;
+    o.s.getRange(o.r, 5, 1, 7).setValues([[st, JSON.stringify(j), Number(o.v[6]), o.v[7], o.v[8] || '', skor, now]]);
+    return hasil(tampil, skor);
   });
 }
 
-// Status Sesi ditulis lebih dulu agar jawaban pasti aman; jika Hasil/Detail gagal, jalankan menu "Pulihkan".
+// Pindahkan sesi yang sudah selesai ke Hasil & Jawaban_Detail secara batch. Berjalan tiap menit (trigger).
+function flushHasil() {
+  const k = LockService.getScriptLock(); if (!k.tryLock(20000)) return;
+  try {
+    const v = sh('Sesi').getDataRange().getValues(), ada = {};
+    sh('Hasil').getDataRange().getValues().slice(1).forEach(r => {
+      if (r[0] instanceof Date) ada[nk(r[4]) + '|' + Math.floor(r[0].getTime() / 1000)] = 1;
+    });
+    const hRows = [], dRows = [], ts = new Date();
+    for (let i = 1; i < v.length; i++) {
+      const x = v[i]; if (!nk(x[0]) || x[4] === 'AKTIF' || !x[4]) continue;
+      const mulai = Math.floor(Number(x[3]) / 1000) * 1000;
+      if (ada[nk(x[0]) + '|' + mulai / 1000]) continue;
+      const r = nilai(safeJson(x[5])), skor = r.a + r.b + r.c, nl = Math.round(skor / TOTAL * 10000) / 100;
+      const sel = Number(x[10]) || Date.now();
+      hRows.push([new Date(mulai), new Date(sel), Math.round((sel - mulai) / 600) / 100, x[1], x[0], x[2], r.a, r.b, r.c, skor, nl, Number(x[6]), String(x[4]), x[8] || '']);
+      r.d.forEach(y => dRows.push([ts, x[0], x[1], y[0], y[1], y[2], y[3]]));
+    }
+    if (hRows.length) { const h = sh('Hasil'); h.getRange(h.getLastRow() + 1, 1, hRows.length, 14).setValues(hRows); }
+    if (dRows.length) { const dt = sh('Jawaban_Detail'); dt.getRange(dt.getLastRow() + 1, 1, dRows.length, 7).setValues(dRows); }
+  } finally { k.releaseLock(); }
+}
+
+// Dipakai menu guru (pulihkan / input manual). Menulis status ke Sesi lalu Hasil + Detail.
 function catat(o, j, st, sudah) {
   const r = nilai(j), skor = r.a + r.b + r.c, nl = Math.round(skor / TOTAL * 10000) / 100;
   const now = Date.now(), mulai = Number(o.v[3]);
-  if (!sudah) o.s.getRange(o.r, 5, 1, 6).setValues([['SELESAI', JSON.stringify(j), Number(o.v[6]), o.v[7], o.v[8] || '', skor]]);
+  if (!sudah) o.s.getRange(o.r, 5, 1, 7).setValues([[st, JSON.stringify(j), Number(o.v[6]), o.v[7], o.v[8] || '', skor, now]]);
   try {
-    sh('Hasil').appendRow([new Date(mulai), new Date(now), Math.round((now - mulai) / 600) / 100, o.v[1], o.v[0], o.v[2], r.a, r.b, r.c, skor, nl, Number(o.v[6]), st, o.v[8] || '']);
+    sh('Hasil').appendRow([new Date(Math.floor(mulai / 1000) * 1000), new Date(Number(o.v[10]) || now), Math.round(((Number(o.v[10]) || now) - mulai) / 600) / 100, o.v[1], o.v[0], o.v[2], r.a, r.b, r.c, skor, nl, Number(o.v[6]), st, o.v[8] || '']);
     const det = sh('Jawaban_Detail'), ts = new Date();
     const rows = r.d.map(x => [ts, o.v[0], o.v[1], x[0], x[1], x[2], x[3]]);
     det.getRange(det.getLastRow() + 1, 1, rows.length, 7).setValues(rows);
