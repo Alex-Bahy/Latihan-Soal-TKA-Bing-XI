@@ -68,7 +68,7 @@ table{width:100%;border-collapse:collapse}td,th{padding:12px 6px;border-bottom:1
 </style></head><body>
 <div id="wm"></div><div id="ov"><div id="ovb"></div></div><div id="app"></div>
 <script>
-const API_URL = "https://script.google.com/macros/s/AKfycbzX3cxSMiWDt2J9dda_CiWXcNPMmG2KqMjJ5BSw17mE0p9N5bOBN5KgvG0IiJSfaJBQ/exec"; // <-- URL deployment Apps Script
+const API_URL = "https://script.google.com/macros/s/AKfycbwpbNN6DTK0sYveEoSWbL2e50kwuvgJgR63RrZ6y-F_VB6g11W__FAcvqAELLMC1abw/exec"; // <-- URL deployment Apps Script
 const $ = s => document.querySelector(s);
 const S = { run: false, jaw: {}, ragu: {}, idx: 0, pel: 0, items: [], dirty: 0 };
 const MOB = matchMedia("(pointer:coarse)").matches;
@@ -77,7 +77,7 @@ const cur = () => S.items[S.idx];
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // ---------- API: POST + cadangan JSONP (GET) + retry exponential backoff ----------
-async function post(a, d, t = 25000) {
+async function post(a, d, t = 30000) {
   const c = new AbortController(), id = setTimeout(() => c.abort(), t);
   try {
     const r = await fetch(API_URL, { method: "POST", headers: { "Content-Type": "text/plain;charset=utf-8" }, signal: c.signal,
@@ -130,7 +130,7 @@ function login(msg) {
   <label class="f" for="j">Jurusan</label><input type="text" id="j" placeholder="mis. AKL, MPLB, ULP" autocomplete="off" autocapitalize="characters">
   <label class="f" for="t">Token ujian</label><input type="text" id="t" autocomplete="off" autocapitalize="characters" placeholder="Diberikan pengawas">
   ${inApp ? `<p class="er mt">Anda memakai browser di dalam aplikasi. Buka halaman ini di Chrome atau Safari agar ujian lancar.</p>` : ""}
-  <ul class="rules"><li>Ujian berjalan dalam layar penuh bila perangkat mendukung.</li><li>Jangan pindah tab atau aplikasi. Pelanggaran berulang mengumpulkan ujian otomatis.</li><li>Copy, paste, dan klik kanan dinonaktifkan. Urutan soal diacak.</li><li>Jawaban tersimpan otomatis. Jika koneksi putus, login lagi dengan data yang sama untuk melanjutkan.</li></ul>
+  <ul class="rules"><li>Ujian berjalan dalam layar penuh pada komputer/laptop.</li><li>Jangan pindah tab atau aplikasi. Keluar dari halaman ujian lebih dari beberapa detik dihitung pelanggaran, dan pelanggaran berulang mengumpulkan ujian otomatis.</li><li>Copy, paste, dan klik kanan dinonaktifkan. Urutan soal diacak.</li><li>Jawaban tersimpan otomatis. Jika koneksi putus, login lagi dengan data yang sama untuk melanjutkan.</li></ul>
   <label style="display:flex;gap:10px;align-items:center"><input type="checkbox" id="c" style="width:22px;height:22px;accent-color:var(--p2)"> Saya mengerti dan setuju</label>
   <button id="go" class="big">Mulai ujian</button><div id="er" class="er mt" role="alert">${esc(msg || "")}</div></div></div>`;
   $("#go").onclick = mulai;
@@ -144,7 +144,8 @@ async function mulai() {
   if (!nama || !nis || !jur || !token) return er("Lengkapi semua kolom.");
   if (!$("#c").checked) return er("Centang persetujuan aturan ujian.");
   S.nama = nama; S.nis = nis; S.kelas = v("k") + " " + jur; S.fs = 0;
-  if (document.documentElement.requestFullscreen) { try { await document.documentElement.requestFullscreen(); S.fs = 1; } catch (e) {} }
+  // Layar penuh hanya di desktop: di HP sering memicu keluar sendiri dan salah deteksi pelanggaran
+  if (!MOB && document.documentElement.requestFullscreen) { try { await document.documentElement.requestFullscreen(); S.fs = 1; } catch (e) {} }
   $("#go").disabled = true; er("Memuat soal...");
   try {
     const r = await api("mulai", { nama, kelas: S.kelas, token, ua: navigator.userAgent }, 4);
@@ -170,6 +171,7 @@ function lengkap(q) {
   const c = a || []; return [0, 1, 2].every(i => c[i]);
 }
 function tampil() {
+  const y = window.scrollY; // jaga posisi scroll saat render ulang
   const q = cur(), n = S.items.length, nav = S.cfg.nav, done = S.items.filter(lengkap).length;
   let h = `<div class="hd"><div><span class="nm">${esc(S.nama)}</span><span>Soal ${S.idx + 1}/${n}</span><span id="tm"></span><span id="sv" title="Status simpan">&#9679; Tersimpan</span></div><div class="pg"><b style="width:${done / n * 100}%"></b></div></div><div class="w"><div class="card">`;
   if (q.s) h += `<div class="st">${esc(q.s)}</div>`;
@@ -192,6 +194,7 @@ function tampil() {
   if (nav) h += `<button class="s" onclick="ragu()">${S.ragu[q.no] ? "Batal ragu" : "Ragu-ragu"}</button>`;
   h += S.idx < n - 1 ? `<button onclick="ke(${S.idx + 1})">Berikutnya</button>` : `<button style="background:var(--ok)" onclick="konfirm()">Kumpulkan</button>`;
   $("#app").innerHTML = h + `</div></div></div>`;
+  scrollTo(0, y);
   tick();
 }
 function pilih(k) {
@@ -208,7 +211,7 @@ function pilih(k) {
 }
 function pilihC(i, j) { const q = cur(), a = S.jaw[q.no] || [null, null, null]; a[i] = q.label[j]; S.jaw[q.no] = a; lokal(); tampil(); }
 function ragu() { const q = cur(); S.ragu[q.no] = !S.ragu[q.no]; lokal(); tampil(); }
-function ke(i) { S.idx = i; lokal(); tampil(); scrollTo(0, 0); }
+function ke(i) { S.idx = i; lokal(); tampil(); scrollTo(0, 0); } // pindah soal: selalu ke atas
 function lokal() { S.dirty = 1; try { localStorage.setItem("tka_" + S.nis, JSON.stringify({ m: S.m, jaw: S.jaw, ragu: S.ragu, idx: S.idx, pel: S.pel })); } catch (e) {} }
 
 // ---------- Timer & sinkron ----------
@@ -256,10 +259,11 @@ async function kirim(auto) {
   } catch (e) { S.sending = false; gagal(auto, e); }
 }
 function gagal(auto, e) {
-  modal(`<h3 class="er">Jawaban belum terkirim</h3><p>${esc(e.final ? e.message : "Koneksi ke server bermasalah.")} Jawaban aman di perangkat ini dan dicoba kirim ulang otomatis tiap 20 detik. Jangan tutup halaman.</p>
+  modal(`<h3 class="er">Jawaban belum terkirim</h3><p>${esc(e.final ? e.message : "Koneksi ke server bermasalah.")} ${e.final ? "" : "Jawaban aman di perangkat ini dan dicoba kirim ulang otomatis tiap 20 detik. "}Jangan tutup halaman.</p>
   <p class="mt">Bila tetap gagal, foto atau salin kode cadangan ini dan serahkan ke guru:</p><textarea readonly onclick="this.select()">${kode()}</textarea>`,
     [["Kirim ulang sekarang", () => kirim(auto)]]);
-  clearInterval(S.rt); S.rt = setInterval(() => kirim(auto), 20000);
+  clearInterval(S.rt);
+  if (!e.final) S.rt = setInterval(() => kirim(auto), 20000); // error final tidak diulang tanpa henti
 }
 addEventListener("online", () => { if (!S.run && S.rt && !S.sending) kirim(""); });
 function selesai(r) {
@@ -270,18 +274,29 @@ function selesai(r) {
 }
 
 // ---------- Anti-nyontek ----------
-let lastP = 0;
+// Pelanggaran baru dihitung bila siswa pergi lebih dari MINAWAY ms lalu kembali,
+// sehingga notifikasi atau gesture sekilas di HP tidak dihitung.
+let lastP = 0, awayAt = 0, awayWhy = "";
+const MINAWAY = 2500;
+function pergi(j) { if (S.run && !awayAt) { awayAt = Date.now(); awayWhy = j; sinkron(); } } // simpan jawaban saat pergi
+function kembali() {
+  if (!awayAt) return;
+  const d = Date.now() - awayAt, j = awayWhy; awayAt = 0;
+  if (S.run && d >= MINAWAY) lapor(j + " (" + Math.round(d / 1000) + " dtk)");
+}
 function lapor(j) {
   if (!S.run) return;
-  const now = Date.now(); if (now - lastP < 2000) return; lastP = now;
+  const now = Date.now(); if (now - lastP < 4000) return; lastP = now;
   S.pel++; lokal();
-  api("log", { jenis: j }, 1).then(r => { if (r && r.pel > S.pel) S.pel = r.pel; }).catch(() => {});
+  api("log", { jenis: j, pel: S.pel }, 1).then(r => { if (r && r.pel > S.pel) S.pel = r.pel; }).catch(() => {});
   if (S.pel >= S.cfg.maks) return kirim("pelanggaran");
   modal(`<h3 class="er">Peringatan ${S.pel} dari ${S.cfg.maks}</h3><p>Terdeteksi: ${esc(j)}. Jika mencapai ${S.cfg.maks} pelanggaran, ujian otomatis dikumpulkan.</p>`,
     [["Kembali ke ujian", () => { hide(); layarPenuh(); }]]);
 }
-document.addEventListener("visibilitychange", () => document.hidden && lapor("pindah tab atau aplikasi"));
-addEventListener("blur", () => { if (!MOB) lapor("jendela tidak aktif"); }); // di HP, blur sering salah deteksi (notifikasi, keyboard)
+document.addEventListener("visibilitychange", () => document.hidden ? pergi("pindah tab atau aplikasi") : kembali());
+addEventListener("blur", () => { if (!MOB) pergi("jendela tidak aktif"); }); // di HP, blur sering salah deteksi
+addEventListener("focus", () => { if (!document.hidden) kembali(); });
+addEventListener("pagehide", () => { if (S.run) sinkron(); });
 document.addEventListener("fullscreenchange", () => { if (S.run && S.fs && !document.fullscreenElement) lapor("keluar layar penuh"); });
 ["contextmenu", "copy", "cut", "paste", "selectstart", "dragstart"].forEach(e => document.addEventListener(e, x => { if (S.run) { x.preventDefault(); if (e === "copy" || e === "paste" || e === "cut") lapor("copy/paste"); } }));
 addEventListener("keydown", e => {
